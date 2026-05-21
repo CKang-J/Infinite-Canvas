@@ -981,7 +981,7 @@
             let id = 'custom-api';
             let index = 2;
             while(providers.some(item => item.id === id)) id = `custom-api-${index++}`;
-            providers.push({id, name:tr('api.newProvider'), base_url:'https://', protocol:'openai', image_generation_endpoint:'', image_edit_endpoint:'', enabled:true, primary:false, image_models:[], chat_models:[], video_models:[], has_key:false, key_preview:''});
+            providers.push({id, name:'API', base_url:'https://', protocol:'openai', image_generation_endpoint:'', image_edit_endpoint:'', enabled:true, primary:false, image_models:[], chat_models:[], video_models:[], has_key:false, key_preview:''});
             selectedId = id;
             renderEditor();
         }
