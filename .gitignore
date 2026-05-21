@@ -1,0 +1,46 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+*.egg
+dist/
+build/
+*.whl
+
+# 内嵌 Python 运行时
+python/Lib/
+python/Scripts/
+python/__pycache__/
+
+# 运行时数据
+data/
+assets/
+output/
+history.json
+
+# 环境配置（含密钥）
+API/.env
+.env
+*.env
+
+# 缓存与临时文件
+*.log
+*.tmp
+.cache/
+*.swp
+*.swo
+*~
+
+# IDE / 编辑器
+.vscode/
+.idea/
+*.suo
+*.user
+*.sln.docstates
+
+# OS 文件
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+.DS_Store
