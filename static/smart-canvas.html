@@ -37,6 +37,7 @@
         button { border:0; cursor:pointer; }
         .shell { position:relative; width:100vw; height:100vh; overflow:hidden; background-color:var(--page); background-image:radial-gradient(var(--grid) 1px, transparent 1px); background-size:24px 24px; cursor:grab; }
         .shell.panning { cursor:grabbing; }
+        .shell.zoom-preview { cursor:crosshair; }
         .world { position:absolute; left:0; top:0; width:6000px; height:4000px; transform-origin:0 0; }
         .smart-back { position:absolute; left:22px; top:22px; z-index:20; height:40px; padding:0 14px; border-radius:999px; display:flex; align-items:center; gap:8px; color:var(--text); background:var(--panel); border:1px solid var(--line); box-shadow:0 16px 40px var(--shadow); backdrop-filter:blur(16px); font-size:12px; font-weight:850; cursor:pointer; }
         .smart-back:hover { transform:translateY(-1px); }
@@ -756,6 +757,7 @@
         let lastConfigRefreshAt = 0;
         let smartMinimapState = null;
         let smartMinimapDrag = false;
+        let zoomPreviewState = null;
         let runTimerInterval = null;
         let smartCascadeRunning = false;
         let runBtnCooldownToken = 0;
@@ -911,7 +913,7 @@
                 return {...(source || {})};
             }
         }
-        function backToCanvasList(){ savePromptDraftForCurrent(); window.location.href = '/static/canvas.html?v=20260521-prompt-node-lock'; }
+        function backToCanvasList(){ savePromptDraftForCurrent(); window.location.href = '/static/canvas.html?v=20260521-mention-token-restore'; }
         function promptPlainText(){
             return promptInput.innerText.replace(/\u00a0/g, ' ').trim();
         }
@@ -924,9 +926,13 @@
         function setPromptText(text){
             promptInput.textContent = text || '';
         }
-        function clearPromptInput(){
+        function clearPromptInput(options={}){
             promptInput.textContent = '';
             closeMentionPicker();
+            if(options.preserveDraft){
+                promptInput.dataset.preserveDraftOnce = '1';
+                return;
+            }
             if(activeComposerSubject){
                 activeComposerSubject.promptDraftHtml = '';
                 activeComposerSubject.promptDraftText = '';
@@ -1110,6 +1116,60 @@
             viewport.y = shell.clientHeight / 2 - point.y * viewport.scale;
             applyViewport();
             scheduleSave();
+        }
+        function fitAllNodesViewport(){
+            if(!nodes.length){
+                viewport.scale = 0.45;
+                viewport.x = shell.clientWidth / 2;
+                viewport.y = shell.clientHeight / 2;
+                applyViewport();
+                scheduleSave();
+                return;
+            }
+            const rects = nodes.map(nodeRect);
+            const minX = Math.min(...rects.map(r => r.x));
+            const minY = Math.min(...rects.map(r => r.y));
+            const maxX = Math.max(...rects.map(r => r.x + r.width));
+            const maxY = Math.max(...rects.map(r => r.y + r.height));
+            const pad = 160;
+            const width = Math.max(1, maxX - minX + pad * 2);
+            const height = Math.max(1, maxY - minY + pad * 2);
+            const nextScale = Math.max(0.06, Math.min(0.82, (shell.clientWidth - 80) / width, (shell.clientHeight - 80) / height));
+            const cx = (minX + maxX) / 2;
+            const cy = (minY + maxY) / 2;
+            viewport.scale = nextScale;
+            viewport.x = shell.clientWidth / 2 - cx * viewport.scale;
+            viewport.y = shell.clientHeight / 2 - cy * viewport.scale;
+            applyViewport();
+            scheduleSave();
+        }
+        function enterZoomPreview(){
+            if(zoomPreviewState) return;
+            zoomPreviewState = {...viewport};
+            shell.classList.add('zoom-preview');
+            closeCreateMenu();
+            fitAllNodesViewport();
+        }
+        function exitZoomPreview(point=null){
+            if(!zoomPreviewState) return false;
+            const prev = zoomPreviewState;
+            zoomPreviewState = null;
+            shell.classList.remove('zoom-preview');
+            viewport.scale = prev.scale;
+            if(point){
+                viewport.x = shell.clientWidth / 2 - point.x * viewport.scale;
+                viewport.y = shell.clientHeight / 2 - point.y * viewport.scale;
+            } else {
+                viewport.x = prev.x;
+                viewport.y = prev.y;
+            }
+            applyViewport();
+            scheduleSave();
+            return true;
+        }
+        function toggleZoomPreview(){
+            if(zoomPreviewState) exitZoomPreview();
+            else enterZoomPreview();
         }
         function imageProviders(){
             return (apiProviders || []).filter(p => p.enabled !== false && p.id !== 'modelscope' && (p.image_models || []).length);
@@ -3523,15 +3583,24 @@
             if(promptInput?.dataset?.promptLocked === '1') return;
             const subject = activeComposerSubject?.id ? activeComposerSubject : selectedNode();
             if(!subject) return;
+            if(promptInput?.dataset?.preserveDraftOnce === '1' && subject.promptDraftHtml){
+                delete promptInput.dataset.preserveDraftOnce;
+                return;
+            }
             subject.promptDraftHtml = promptInput.innerHTML;
             subject.promptDraftText = promptPlainText();
             subject.runSettings = cloneSmartSettings(settings);
         }
         function loadPromptDraft(subject){
             if(subject?.promptDraftHtml){
-                promptInput.innerHTML = subject.promptDraftHtml;
+                const hasToken = String(subject.promptDraftHtml || '').includes('mention-image-token');
+                promptInput.innerHTML = hasToken
+                    ? subject.promptDraftHtml
+                    : (promptHtmlWithMentionTokens(subject.runPrompt || subject.promptDraftText || '', subject.runPromptRefs || []) || subject.promptDraftHtml);
             } else if(typeof subject?.runPrompt === 'string'){
-                setPromptText(subject.runPrompt);
+                const rebuilt = promptHtmlWithMentionTokens(subject.runPrompt, subject.runPromptRefs || []);
+                if(rebuilt) promptInput.innerHTML = rebuilt;
+                else setPromptText(subject.runPrompt);
             } else {
                 setPromptText('');
             }
@@ -3743,12 +3812,38 @@
             const h = rows * (cellH + 8) + 16;
             return {w, h};
         }
-        function snapshotRunMeta(prompt, sourceId, displayPrompt=''){
+        function mentionTokenHtml(img){
+            if(!img?.url) return '';
+            const name = img.alias || img.name || '图片';
+            return `<span class="mention-image-token" contenteditable="false" data-url="${escapeHtml(img.url)}" data-name="${escapeHtml(name)}" data-node-id="${escapeHtml(img.nodeId || '')}" data-image-index="${escapeHtml(img.imageIndex ?? '')}"><img src="${escapeHtml(img.url)}" alt=""><span>${escapeHtml(name)}</span></span>`;
+        }
+        function promptHtmlWithMentionTokens(text, refs=[]){
+            const value = String(text || '');
+            const items = (refs || []).filter(ref => ref?.url && ref?.name).sort((a, b) => String(b.name || '').length - String(a.name || '').length);
+            if(!value || !items.length || !value.includes('@')) return '';
+            let html = '';
+            let index = 0;
+            while(index < value.length){
+                if(value[index] === '@'){
+                    const hit = items.find(ref => value.slice(index + 1, index + 1 + String(ref.name || '').length) === String(ref.name || ''));
+                    if(hit){
+                        html += mentionTokenHtml(hit);
+                        index += 1 + String(hit.name || '').length;
+                        continue;
+                    }
+                }
+                html += escapeHtml(value[index]);
+                index += 1;
+            }
+            return html;
+        }
+        function snapshotRunMeta(prompt, sourceId, displayPrompt='', refs=[]){
             return {
                 prompt,
                 displayPrompt:displayPrompt || promptPlainText() || prompt,
                 promptHtml: promptInput ? promptInput.innerHTML : '',
                 promptText: promptPlainText(),
+                promptRefs:(refs || []).map(ref => ({url:ref.url || '', name:ref.name || '', nodeId:ref.nodeId || '', imageIndex:ref.imageIndex ?? ''})).filter(ref => ref.url),
                 sourceNodeId:sourceId,
                 settings:JSON.parse(JSON.stringify(settings)),
                 createdAt:Date.now()
@@ -3758,12 +3853,15 @@
             if(!targetNode || !meta) return;
             targetNode.runPrompt = meta.displayPrompt || meta.promptText || meta.prompt;
             targetNode.runModelPrompt = meta.prompt;
+            targetNode.runPromptRefs = meta.promptRefs || [];
             targetNode.runSettings = meta.settings;
             targetNode.sourceNodeId = meta.sourceNodeId;
             targetNode.runAt = meta.createdAt;
             // 保存可编辑的 @-提及表单到草稿字段，方便点输出节点时还原原始可编辑形式
             if(meta.promptHtml != null){
-                targetNode.promptDraftHtml = meta.promptHtml;
+                const htmlHasToken = String(meta.promptHtml || '').includes('mention-image-token');
+                const rebuiltHtml = htmlHasToken ? '' : promptHtmlWithMentionTokens(meta.displayPrompt || meta.promptText || '', meta.promptRefs || []);
+                targetNode.promptDraftHtml = htmlHasToken ? meta.promptHtml : (rebuiltHtml || meta.promptHtml);
                 targetNode.promptDraftText = meta.promptText || '';
             }
             targetNode.images = (targetNode.images || []).map(img => stripImageGenerationMeta(img));
@@ -4136,8 +4234,20 @@
             promptInput.childNodes.forEach(walk);
             return parts;
         }
+        function originalPromptTextFromParts(parts){
+            let text = '';
+            (parts || []).forEach(part => {
+                if(part.type === 'text'){
+                    text += part.text || '';
+                    return;
+                }
+                if(part.type === 'image') text += `@${part.name || '图片'}`;
+            });
+            return text.replace(/[ \t]+\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim();
+        }
         function buildPromptRequest(node, overrideDefaultImages=null, consumeDefault=false){
             const parts = collectPromptParts();
+            const originalPrompt = originalPromptTextFromParts(parts);
             const defaultRefs = uniqueReferenceImages(overrideDefaultImages || defaultReferenceImagesFor(node, consumeDefault));
             const refs = defaultRefs.map((img, index) => ({...img, role:`image_${index + 1}`}));
             const refMap = new Map();
@@ -4158,7 +4268,7 @@
             body = body.replace(/[ \t]+\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim();
             const inputPrompt = inputPromptTextFor(node).trim();
             if(promptInputNodesFor(node).length) body = inputPrompt;
-            const displayPrompt = body;
+            const displayPrompt = originalPrompt || body;
             if(refs.length){
                 const mapText = refs.map((img, i) => `图${i + 1}：${img.name || `图片${i + 1}`}`).join('\n');
                 return {
@@ -4368,8 +4478,16 @@
             cascadeRunBtn.disabled = smartCascadeRunning || Boolean(node?.running);
         }
         function loadNodePromptDraftToInput(node){
-            if(node?.promptDraftHtml) promptInput.innerHTML = node.promptDraftHtml;
-            else setPromptText(node?.runPrompt || '');
+            if(node?.promptDraftHtml) {
+                const hasToken = String(node.promptDraftHtml || '').includes('mention-image-token');
+                promptInput.innerHTML = hasToken
+                    ? node.promptDraftHtml
+                    : (promptHtmlWithMentionTokens(node.runPrompt || node.promptDraftText || '', node.runPromptRefs || []) || node.promptDraftHtml);
+            } else {
+                const rebuilt = promptHtmlWithMentionTokens(node?.runPrompt || '', node?.runPromptRefs || []);
+                if(rebuilt) promptInput.innerHTML = rebuilt;
+                else setPromptText(node?.runPrompt || '');
+            }
         }
         function buildPromptRequestForNode(node, defaultImages){
             const oldHtml = promptInput.innerHTML;
@@ -4465,6 +4583,7 @@
             const meta = {
                 prompt,
                 displayPrompt:request.displayPrompt || '',
+                promptRefs:(request.refs || []).map(ref => ({url:ref.url || '', name:ref.name || '', nodeId:ref.nodeId || '', imageIndex:ref.imageIndex ?? ''})).filter(ref => ref.url),
                 sourceNodeId:sourceNode.id,
                 settings:JSON.parse(JSON.stringify(settings)),
                 createdAt:Date.now()
@@ -4651,7 +4770,7 @@
             if(!node) return;
             if(!prompt){ toast(tr('smart.toastNeedPrompt')); return; }
             const refs = request.refs;
-            const meta = snapshotRunMeta(prompt, node.id, request.displayPrompt);
+            const meta = snapshotRunMeta(prompt, node.id, request.displayPrompt, refs);
             const expectedCount = settings.engine === 'comfy'
                 ? (settings.comfyMode === 'text' || settings.comfyMode === 'enhance' || settings.comfyMode === 'edit' || settings.comfyMode === 'custom' ? 1 : 1)
                 : Math.max(1, Math.min(8, Number(settings.count || 1)));
@@ -4702,7 +4821,7 @@
                     const outVideos = await runApiVideoGeneration(prompt, refs);
                     if(!outVideos.length) throw new Error(tr('smart.errNoOutVideos'));
                     finalizePendingNode(pendingNode, outVideos, meta, 'video');
-                    clearPromptInput();
+                    clearPromptInput({preserveDraft:true});
                     scheduleSave();
                     return;
                 }
@@ -4711,7 +4830,7 @@
                     : await runApiGeneration(prompt, refs);
                 if(!outImages.length) throw new Error(tr('smart.errNoOutImages'));
                 finalizePendingNode(pendingNode, outImages, meta);
-                clearPromptInput();
+                clearPromptInput({preserveDraft:true});
                 scheduleSave();
             } catch(e) {
                 pendingNode.pending = 0;
@@ -4910,7 +5029,7 @@
                 attachRunMeta(created, meta);
                 addConnection(node.id, created.id);
             }
-            clearPromptInput();
+            clearPromptInput({preserveDraft:true});
             scheduleSave();
         }
         async function runComfyText(node, prompt, pendingNode, meta){
@@ -4928,7 +5047,7 @@
                 attachRunMeta(created, meta);
                 addConnection(node.id, created.id);
             }
-            clearPromptInput();
+            clearPromptInput({preserveDraft:true});
             scheduleSave();
         }
         async function runComfyEnhance(node, refs, pendingNode, meta){
@@ -4968,7 +5087,7 @@
                 attachRunMeta(created, meta);
                 addConnection(node.id, created.id);
             }
-            clearPromptInput();
+            clearPromptInput({preserveDraft:true});
             scheduleSave();
         }
         async function comfyNameForRef(ref){
@@ -4990,7 +5109,7 @@
             return name;
         }
         async function pollTask(taskId){
-            for(let i = 0; i < 240; i++){
+            for(let i = 0; i < 900; i++){
                 await new Promise(resolve => setTimeout(resolve, 2000));
                 const task = await fetch(`/api/canvas-image-tasks/${encodeURIComponent(taskId)}`).then(r => r.json());
                 if(task.status === 'succeeded') return task.result;
@@ -5097,7 +5216,23 @@
             if(type === 'loop') return createLoopNode(p.x - 135, p.y - 95);
             return createNode(p.x - 130, p.y - 90);
         }
+        shell.addEventListener('mousedown', e => {
+            if(!zoomPreviewState) return;
+            if(e.button !== 0) return;
+            if(e.target.closest('.composer,.smart-back,.asset-panel,.asset-toggle,.image-edit-modal,.create-menu,.smart-minimap')) return;
+            e.preventDefault();
+            e.stopPropagation();
+        }, true);
+        shell.addEventListener('click', e => {
+            if(!zoomPreviewState) return;
+            if(e.button !== 0) return;
+            if(e.target.closest('.composer,.smart-back,.asset-panel,.asset-toggle,.image-edit-modal,.create-menu,.smart-minimap')) return;
+            e.preventDefault();
+            e.stopPropagation();
+            exitZoomPreview(screenToWorld(e));
+        }, true);
         shell.onmousedown = e => {
+            if(zoomPreviewState && e.button === 0 && !e.target.closest('.composer,.smart-back,.asset-panel,.asset-toggle,.image-edit-modal,.create-menu,.smart-minimap')) return;
             if(e.target.closest('.image-node,.composer,.smart-back,.create-menu,.smart-minimap')) return;
             closeCreateMenu();
             if(e.button === 0 && e.ctrlKey){
@@ -5436,14 +5571,29 @@
             }
         });
         window.addEventListener('keydown', e => {
-            if((e.ctrlKey || e.metaKey) && String(e.key).toLowerCase() === 'c' && !isEditableTarget(e.target)){
+            const key = String(e.key || '').toLowerCase();
+            if(!e.ctrlKey && !e.metaKey && !e.altKey && !isEditableTarget(e.target)){
+                if(key === 'z'){
+                    if(e.repeat) return;
+                    e.preventDefault();
+                    toggleZoomPreview();
+                    return;
+                }
+                if(key === 'a'){
+                    if(e.repeat) return;
+                    e.preventDefault();
+                    toggleAssetLibrary();
+                    return;
+                }
+            }
+            if((e.ctrlKey || e.metaKey) && key === 'c' && !isEditableTarget(e.target)){
                 const selectionText = window.getSelection?.().toString() || '';
                 if(selectionText) return;
                 e.preventDefault();
                 copySelectedNodes();
                 return;
             }
-            if((e.ctrlKey || e.metaKey) && String(e.key).toLowerCase() === 'v' && !isEditableTarget(e.target) && nodeClipboard?.nodes?.length){
+            if((e.ctrlKey || e.metaKey) && key === 'v' && !isEditableTarget(e.target) && nodeClipboard?.nodes?.length){
                 const requestedAt = Date.now();
                 setTimeout(() => {
                     if(lastImagePasteAt >= requestedAt) return;
@@ -5455,7 +5605,7 @@
                 closeImageEditor();
                 return;
             }
-            if((e.ctrlKey || e.metaKey) && String(e.key).toLowerCase() === 'z' && !isEditableTarget(e.target)){
+            if((e.ctrlKey || e.metaKey) && key === 'z' && !isEditableTarget(e.target)){
                 e.preventDefault();
                 performUndo();
                 return;
@@ -5595,6 +5745,7 @@
         });
         promptInput.addEventListener('input', maybeOpenMentionPicker);
         promptInput.addEventListener('input', () => {
+            delete promptInput.dataset.preserveDraftOnce;
             savePromptDraftForCurrent();
             renderInputThumbsRow(selectedNode());
             scheduleSave();
